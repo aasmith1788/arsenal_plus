@@ -10,6 +10,18 @@ data[, atbat_group := cumsum(has_event), by = .(pitcher, game_year)]
 # Keep only pitches that belong to complete at-bats
 data_clean <- data[atbat_group > 0]
 
+# Calculate release-time angles for every pitch --------------------------------
+# Time for the pitch to reach 50 feet from the plate
+data_clean[, tr := (-vy0 - sqrt(vy0^2 - 2 * ay * (50 - release_pos_y))) / ay]
+# Velocities at that time
+data_clean[, vy_r := vy0 + ay * tr]
+data_clean[, vx_r := vx0 + ax * tr]
+data_clean[, vz_r := vz0 + az * tr]
+# Vertical and horizontal release angles
+data_clean[, VRA := -atan2(vz_r, vy_r)]
+data_clean[, HRA := -atan2(vx_r, vy_r)]
+data_clean[, c("tr", "vy_r", "vx_r", "vz_r") := NULL]
+
 # Get unique pitch types for binary columns
 unique_pitch_types <- unique(data_clean$pitch_type[!is.na(data_clean$pitch_type)])
 
@@ -169,7 +181,67 @@ result$Arsenal_Area <- apply(result, 1, function(row) {
   # Extract horizontal and vertical break values and convert to inches
   hor_values <- as.numeric(row[pfx_x_cols]) * 12
   vert_values <- as.numeric(row[pfx_z_cols]) * 12
-  
+
   # Calculate arsenal area
   calculate_arsenal_area(hor_values, vert_values)
 })
+
+# ---------------------------------------------------------------------------
+# Calculate VRA/HRA based tunneling consistency for each at-bat
+
+# Full season VRA/HRA means and pitch frequencies by pitcher and pitch type
+pitch_stats <- data_clean[, .(
+  mean_VRA = mean(VRA, na.rm = TRUE),
+  mean_HRA = mean(HRA, na.rm = TRUE),
+  pitch_count = .N
+), by = .(pitcher, pitch_type)]
+
+# Total pitches thrown by pitcher to get frequency
+pitcher_totals <- data_clean[, .(total_pitches = .N), by = pitcher]
+pitch_stats <- merge(pitch_stats, pitcher_totals, by = "pitcher")
+pitch_stats[, freq := pitch_count / total_pitches]
+
+# Identify primary pitch for each pitcher
+setorder(pitch_stats, pitcher, -freq)
+primary_pitch <- pitch_stats[, .SD[1], by = pitcher]
+
+# Merge primary pitch info onto result
+result <- merge(result,
+                primary_pitch[, .(pitcher_id = pitcher,
+                                  primary_pitch = pitch_type,
+                                  primary_VRA = mean_VRA,
+                                  primary_HRA = mean_HRA)],
+                by = "pitcher_id",
+                all.x = TRUE)
+
+# Initialize tunneling columns
+result[, `:=`(VRA_tunneling_atbat = 0, HRA_tunneling_atbat = 0)]
+
+# Function to calculate tunneling for a single at-bat
+calc_tunnel <- function(pid, ab, prim_pt, prim_vra, prim_hra) {
+  ab_pitches <- data_clean[pitcher == pid & atbat_group == ab & !is.na(pitch_type)]
+  pts <- unique(ab_pitches$pitch_type)
+  pts <- pts[pts != prim_pt]
+  if (length(pts) == 0) {
+    return(list(0, 0))
+  }
+  stats <- pitch_stats[pitcher == pid & pitch_type %in% pts]
+  if (nrow(stats) == 0) {
+    return(list(0, 0))
+  }
+  vra_diffs <- abs(stats$mean_VRA - prim_vra)
+  hra_diffs <- abs(stats$mean_HRA - prim_hra)
+  wts <- stats$freq
+  c(sum(wts * vra_diffs) / sum(wts), sum(wts * hra_diffs) / sum(wts))
+}
+
+# Loop over result rows to compute tunneling values
+for(i in seq_len(nrow(result))) {
+  res <- calc_tunnel(result$pitcher_id[i],
+                     result$at_bat[i],
+                     result$primary_pitch[i],
+                     result$primary_VRA[i],
+                     result$primary_HRA[i])
+  result$VRA_tunneling_atbat[i] <- res[[1]]
+  result$HRA_tunneling_atbat[i] <- res[[2]]
+}
