@@ -214,34 +214,48 @@ result <- merge(result,
                 by = "pitcher_id",
                 all.x = TRUE)
 
-# Initialize tunneling columns
-result[, `:=`(VRA_tunneling_atbat = 0, HRA_tunneling_atbat = 0)]
+# -----------------------------------------------------------------------
+# Vectorized at-bat tunneling computation
 
-# Function to calculate tunneling for a single at-bat
-calc_tunnel <- function(pid, ab, prim_pt, prim_vra, prim_hra) {
-  ab_pitches <- data_clean[pitcher == pid & atbat_group == ab & !is.na(pitch_type)]
-  pts <- unique(ab_pitches$pitch_type)
-  pts <- pts[pts != prim_pt]
-  if (length(pts) == 0) {
-    return(list(0, 0))
-  }
-  stats <- pitch_stats[pitcher == pid & pitch_type %in% pts]
-  if (nrow(stats) == 0) {
-    return(list(0, 0))
-  }
-  vra_diffs <- abs(stats$mean_VRA - prim_vra)
-  hra_diffs <- abs(stats$mean_HRA - prim_hra)
-  wts <- stats$freq
-  c(sum(wts * vra_diffs) / sum(wts), sum(wts * hra_diffs) / sum(wts))
-}
+# Pitch counts by at-bat and pitch type
+ab_pitch_counts <- data_clean[!is.na(pitch_type),
+                              .(pitch_count = .N),
+                              by = .(pitcher, atbat_group, pitch_type)]
 
-# Loop over result rows to compute tunneling values
-for(i in seq_len(nrow(result))) {
-  res <- calc_tunnel(result$pitcher_id[i],
-                     result$at_bat[i],
-                     result$primary_pitch[i],
-                     result$primary_VRA[i],
-                     result$primary_HRA[i])
-  result$VRA_tunneling_atbat[i] <- res[[1]]
-  result$HRA_tunneling_atbat[i] <- res[[2]]
-}
+# Add season release-angle stats and primary pitch info
+ab_pitch_counts <- merge(ab_pitch_counts, pitch_stats,
+                         by = c("pitcher", "pitch_type"),
+                         all.x = TRUE)
+ab_pitch_counts <- merge(ab_pitch_counts,
+                         primary_pitch[, .(pitcher,
+                                           primary_pitch = pitch_type,
+                                           primary_VRA = mean_VRA,
+                                           primary_HRA = mean_HRA)],
+                         by = "pitcher",
+                         all.x = TRUE)
+
+# Calculate release-angle differences
+ab_pitch_counts[, `:=`(
+  VRA_diff = abs(mean_VRA - primary_VRA),
+  HRA_diff = abs(mean_HRA - primary_HRA)
+)]
+
+# Remove primary pitch rows
+ab_sec <- ab_pitch_counts[pitch_type != primary_pitch]
+
+# Weighted average differences per at-bat
+tunnel_metrics <- ab_sec[, .(
+  VRA_tunneling_atbat = sum(freq * VRA_diff) / sum(freq),
+  HRA_tunneling_atbat = sum(freq * HRA_diff) / sum(freq)
+), by = .(pitcher, atbat_group)]
+
+# Merge tunneling metrics back onto result
+result <- merge(result,
+                tunnel_metrics,
+                by.x = c("pitcher_id", "at_bat"),
+                by.y = c("pitcher", "atbat_group"),
+                all.x = TRUE)
+
+# Replace NA values with 0 (no secondary pitches thrown)
+result[is.na(VRA_tunneling_atbat), VRA_tunneling_atbat := 0]
+result[is.na(HRA_tunneling_atbat), HRA_tunneling_atbat := 0]
